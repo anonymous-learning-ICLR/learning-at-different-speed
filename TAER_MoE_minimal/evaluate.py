@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from train import parser as training_parser
+from train_legacy import parser as training_parser
 from TCNM.data.trajectoriesWithMe_unet_training_4to4 import TrajectoryDataset, seq_collate
 from TCNM.models_prior_unet4to4_tsi_router import TrajectoryGenerator
 from TCNM.losses import toNE

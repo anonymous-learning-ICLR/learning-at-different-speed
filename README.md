@@ -10,8 +10,11 @@ All runnable components are in `TAER_MoE_minimal/`:
 
 | File or directory | Purpose |
 | --- | --- |
-| `train.py` | Training entry point; requires separate training and validation data |
-| `evaluate.py` | Load the checkpoint and print evaluation tables |
+| `train.py`, `train_paper.py` | Epoch-based training entry points; require separate training and validation data |
+| `train_fast.py` | Optional input prefetching, caching, and progress logging for the same training loop |
+| `paper_pipeline.py`, `taer_feedback.py` | Training objective, expert-task statistics, and routing feedback |
+| `evaluate.py`, `train_legacy.py` | Evaluation and architecture defaults for the bundled checkpoint |
+| `evaluate_paper.py` | Evaluate checkpoints produced by the current training entry point |
 | `visualize.py` | Generate the four data visualization outputs |
 | `TCNM/` | Model architectures, data loaders, losses, and utilities |
 | `install.sh` | Python dependency installation |
@@ -106,15 +109,77 @@ The environmental figure uses **time × grid y × grid x** at a single pressure 
 
 ## Training code and completeness checks
 
-The training entry point and its local dependencies are included. Inspect its options with:
+`train.py` delegates to the epoch-based driver in `train_paper.py`. The model, data loader, losses, expert-task statistics, and feedback controller are included. Inspect its options with:
 
 ```bash
 python train.py --help
 ```
 
-Training requires the full data layout, including separate `train` and `val` splits and their corresponding environmental assets. The bundled test example is intended for evaluation and visualization, and is insufficient for training.
+Training requires separately authorized training and validation data. The bundled test example is intended for evaluation and visualization and is insufficient for training. `--data-root` is the parent of the following folders:
 
-The sample release was checked by parsing all 12 Python files, loading the training command's help, evaluating the supplied checkpoint on the demo, and regenerating the four visualization files. Full training and full-dataset evaluation are not covered by this demo check.
+```text
+TropiCycloneNet1/
+  bst_divi10_train_val_test_inlcude15_2023_new/<AREA>/{train,val,test}/*.txt
+  all_area_correct_location_includeunder15_2023/
+  all_ocean_gph500_2023/
+  features6/
+  features10/
+```
+
+Preserve the environmental assets' basin/year/storm/timestamp organization. Run on GPU 0:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u train.py \
+  --data-root /path/to/TropiCycloneNet1 \
+  --output-dir ./runs/full_seed3407_tc3_inputs \
+  --variant full \
+  --seed 3407 \
+  --device cuda \
+  --areas EP NA NI SI SP WP \
+  --epochs 100 \
+  --batch-size 16 \
+  --workers 0 \
+  --threads 2 \
+  --feature-mode legacy \
+  --feature-reduction none \
+  --split-policy existing
+```
+
+`python train_paper.py` is equivalent. Keep the explicit seed and batch size in this command, since the parser's generic defaults differ. Each epoch traverses the full training loader, including the final partial batch. After each epoch, the controller collects training and validation expert-task errors, computes routing corrections, and applies them through `set_feedback()` before evaluating and saving the updated state.
+
+`--feature-mode legacy --feature-reduction none` retains the original Feature 6/10 handling: `timestamp.npy` lookup, original storm-name fallback, zero/partial-load fallback, and no spatial pooling. Files with `_features6.npy` or `_features10.npy` suffixes are ignored by this mode. The visualization code displays the stored maps independently of this training lookup.
+
+The run directory contains `last.pt` after each completed epoch, `best.pt` when validation ADE improves, `feedback.jsonl`, the configuration, and the split manifest. Resume in the same output directory by adding `--resume ./runs/full_seed3407_tc3_inputs/last.pt`. Source hashes and the split manifest are checked on resume. This driver saves at epoch boundaries.
+
+For optional input acceleration and progress logging, replace `train.py` with `train_fast.py`, keep the training arguments above, and append:
+
+```text
+--io-workers 1 --prefetch-factor 2 --cache-frames 4096 --pin-memory --log-every 50
+```
+
+This adds ordered input prefetching, caching, pinned transfers, and `OUTPUT_DIR/out.log` without changing the training loop or its configuration. Use a fresh output directory or explicitly resume an existing run.
+
+Evaluate a newly trained checkpoint with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_paper.py \
+  --checkpoint ./runs/full_seed3407_tc3_inputs/best.pt \
+  --data-root /path/to/TropiCycloneNet1 \
+  --device cuda \
+  --output ./runs/full_seed3407_tc3_inputs/test_metrics.json
+```
+
+`evaluate_paper.py` loads the new `taer-paper-reconstruction-v1` format and keeps its saved routing feedback fixed. It prints and saves aggregate metrics as JSON. By default, it requires train/validation/test folders to audit split overlap. `--demo-only` skips that audit for test-only demonstrations but still requires test data for all areas configured in the checkpoint. The bundled WP example alone is insufficient for a checkpoint configured for all six areas.
+
+The previously supplied `seed3047ckpt.pt` retains its original format and continues to use `evaluate.py`, as shown above. It is not interchangeable with checkpoints from the current training entry point. The previous training module is retained as `train_legacy.py` for the legacy evaluator's architecture defaults. No private training/validation data or newly trained checkpoint is included in this update.
+
+Run the implementation checks from `TAER_MoE_minimal/`:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+These cover routing feedback, expert-task statistics, data handling, model gradients, saving/resuming training, evaluation, and input-pipeline consistency. Full training requires the separately authorized data.
 
 ## Planned data release
 
