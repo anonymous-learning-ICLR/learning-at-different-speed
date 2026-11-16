@@ -4,7 +4,7 @@ import unittest
 import torch
 from taer_feedback import bounded_allocation, normalized_gap, RouteAccumulator, FeedbackController, VARIANTS
 from paper_pipeline import (make_model, task_losses, absolute_outputs, objective, collect_statistics, seed_all)
-from train_paper import train_epoch
+from train import train_epoch
 
 
 def synthetic_batch(model, batch=2):

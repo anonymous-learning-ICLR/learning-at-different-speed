@@ -8,8 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-import train_fast
-import train_paper
+import train
 from paper_pipeline import load_checkpoint, make_model, seed_all
 from test_paper import synthetic_batch
 
@@ -48,13 +47,13 @@ class FastParity(unittest.TestCase):
                       '--device', 'cpu', '--batch-size', '1', '--workers', '0']
             fast = ['--io-workers', '1', '--prefetch-factor', '2', '--cache-frames', '4',
                     '--pin-memory', '--log-every', '100']
-            with patch.object(train_paper, 'split_manifest', return_value={'train': [], 'val': []}), \
-                 patch.object(train_paper, 'make_dataset', return_value=dataset), \
-                 patch.object(train_paper, 'loader', batches):
-                train_paper.main(common + ['--epochs', '2', '--output-dir', str(root/'original')])
-                train_fast.main(common + fast + ['--epochs', '2', '--output-dir', str(root/'fast')])
-                train_paper.main(common + ['--epochs', '1', '--output-dir', str(root/'resumed')])
-                train_fast.main(common + fast + ['--epochs', '2', '--output-dir', str(root/'resumed'),
+            with patch.object(train, 'split_manifest', return_value={'train': [], 'val': []}), \
+                 patch.object(train, 'make_dataset', return_value=dataset), \
+                 patch.object(train, 'loader', batches):
+                train.main(common + ['--epochs', '2', '--output-dir', str(root/'original')])
+                train.main(common + fast + ['--epochs', '2', '--output-dir', str(root/'fast')])
+                train.main(common + ['--epochs', '1', '--output-dir', str(root/'resumed')])
+                train.main(common + fast + ['--epochs', '2', '--output-dir', str(root/'resumed'),
                     '--resume', str(root/'resumed'/'last.pt')])
             expected = load_checkpoint(root/'original'/'last.pt')
             for name in ('fast', 'resumed'):

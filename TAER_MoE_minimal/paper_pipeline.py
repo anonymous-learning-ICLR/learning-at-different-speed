@@ -214,8 +214,8 @@ def jsonable(value):
 
 def source_hashes():
     root = Path(__file__).resolve().parent
-    names = ['train_paper.py', 'paper_pipeline.py', 'taer_feedback.py', 'TCNM/paper_model.py',
+    names = ['train.py', 'paper_pipeline.py', 'taer_feedback.py', 'TCNM/paper_model.py',
              'TCNM/data/paper_data.py', 'TCNM/models_prior_unet4to4_tsi_router.py',
              'TCNM/Unet3D_merge_tiny4to4_dynamic.py', 'TCNM/env_net_transformer_gphsplit.py',
-             'TCNM/losses.py']
+             'TCNM/losses.py', 'checkpoint_compat.py']
     return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}

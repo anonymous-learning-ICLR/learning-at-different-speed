@@ -7,7 +7,7 @@ import numpy as np
 
 from TCNM.data.paper_data import load_legacy_feature_pair
 from paper_pipeline import TRACK, make_dataset, split_manifest
-from train_paper import parser
+from train import parser
 
 
 class LegacyInputs(unittest.TestCase):
