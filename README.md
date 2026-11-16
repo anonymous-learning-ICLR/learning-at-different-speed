@@ -200,18 +200,20 @@ CUDA_VISIBLE_DEVICES=0 python -u meta.py \
 
 This protocol fits coefficients using test labels, so the reported errors are not independent held-out test estimates. The checkpoint records this choice. For separate calibration, use `--fit-split val` instead; this is the default when the option is omitted. Fitting checks the existing train/val/test split manifests. Scikit-learn and SciPy are needed for fitting and are included in `install.sh`; inference applies the stored coefficients without either package.
 
-Test using only the combined checkpoint and evaluation data:
+Test using only the combined checkpoint and evaluation data. The combined-checkpoint test is integrated into the existing `evaluate.py` entry:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -u evaluate.py \
-  --checkpoint ./runs/seed200_combined/ckpt.pt \
-  --data-root /path/to/TropiCycloneNet1 \
+  --ckpt_path ./runs/seed200_combined/ckpt.pt \
+  --data_root /path/to/TropiCycloneNet1 \
   --areas EP NA NI SI SP WP \
-  --device cuda --batch-size 64 --threads 2 --io-workers 2 \
-  --output ./runs/seed200_combined/eval_report
+  --device cuda --batch_size 64 --threads 4 --io-workers 2 \
+  --output_dir ./runs/seed200_combined/eval_report
 ```
 
 For CPU execution, use `--device cpu`. Testing never fits new coefficients or updates routing feedback. It prints an initial running message followed by `GLOBAL (N=...)` and the EP, NA, NI, SI, SP, WP tables, with ADE/FDE, per-step TDE/pressure/wind errors, and AVG. `eval_report/summary.txt` contains the same tables. GLOBAL aggregates actual windows and valid timesteps across the selected basins. Optional `--progress-log /path/to/progress.log` writes progress separately without adding console messages.
+
+For combined checkpoints, omitting `--output_dir` saves the tables to `./test_report/summary.txt`. Batch size, CPU thread count, input-reader count, and cache capacity default to the saved evaluation settings; explicit options override them. `--workers` is also accepted as an alias for `--io-workers` for this format, with `0` selecting serial loading. `--checkpoint`, `--data-root`, `--batch-size`, and `--output` remain supported aliases. Only test data for the selected basins is required; original member checkpoint files and training/validation data are not needed.
 
 The combined checkpoint has format `taer-paper-meta-ensemble-v1`; `evaluate.py` detects it automatically alongside the two previously supported formats. New training snapshots require a new fusion build to be included. Existing output checkpoint files are not overwritten.
 

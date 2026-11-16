@@ -1,14 +1,15 @@
-"""Evaluate epoch-model checkpoints, original snapshots, or existing ensembles.
+"""Evaluate a combined ckpt.pt, epoch-model checkpoint, or original snapshot.
 
-Example: python evaluate.py --checkpoint /path/to/seed3047ckpt.pt
-         --data-dir /path/to/TropiCycloneNet1 --device cuda --seed 3407
+Example: python evaluate.py --ckpt_path /path/to/ckpt.pt
+         --data_root /path/to/TropiCycloneNet1 --device cuda --output_dir test_report
 
-The checkpoint format selects the evaluator automatically. Epoch-model checkpoints
-use frozen feedback and --output metrics.json; ensembles retain their table output.
+Combined epoch-model checkpoints print a running notice followed by GLOBAL and
+per-basin tables, also saved to test_report/summary.txt by default. Only the test
+split is read; saved fusion coefficients and routing feedback are not refitted.
 
-Ensembles apply their saved per-area coefficients without refitting. Their original
-Best-of-K protocol uses true future tracks to select candidates. Historical fusion
-coefficients fitted on test data do not constitute an independent held-out score.
+The format selects the evaluator automatically. Single epoch-model checkpoints
+use --output metrics.json. Original ensembles retain their ground-truth Best-of-K
+protocol. Fusion fitted on test data does not constitute a held-out test score.
 """
 import argparse
 import contextlib
@@ -288,19 +289,21 @@ def main(argv=None):
     parser.add_argument('--checkpoint', '--ckpt_path', required=True)
     parser.add_argument('--data-dir', '--data-root', '--data_root', default='data_test')
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
-    parser.add_argument('--gpu_num', help='Optional CUDA visibility override; legacy default: 0')
+    parser.add_argument('--gpu-num', '--gpu_num', dest='gpu_num', help='Optional CUDA visibility override; legacy default: 0')
     parser.add_argument('--state-key', default='auto')
     parser.add_argument('--areas', nargs='+', choices=AREAS)
     parser.add_argument('--seed', type=int)
     parser.add_argument('--batch-size', '--batch_size', type=int)
     parser.add_argument('--num-samples', '--num_samples', type=int)
-    parser.add_argument('--workers', '--loader_num_workers', type=int, default=None)
+    parser.add_argument('--workers', '--loader_num_workers', type=int, default=None,
+                        help='Loader workers; for combined epoch models, an alias for --io-workers')
     parser.add_argument('--threads', type=int)
-    parser.add_argument('--io-workers', type=int, default=1, help='Embedded epoch ensemble: ordered reader threads')
-    parser.add_argument('--cache-frames', type=int, default=4096, help='Embedded epoch ensemble: bounded input cache')
+    parser.add_argument('--io-workers', type=int, help='Embedded epoch ensemble: ordered reader threads; 0 reads serially')
+    parser.add_argument('--cache-frames', type=int, help='Embedded epoch ensemble: bounded input cache; 0 disables caching')
     parser.add_argument('--progress-log', help='Optional progress file for embedded epoch ensemble evaluation')
     parser.add_argument('--limit', type=int, help='Development only: first N windows per area')
-    parser.add_argument('--output', '--output_dir', help='Legacy: directory for summary.txt; epoch model: JSON file path (required)')
+    parser.add_argument('--output', '--output-dir', '--output_dir',
+                        help='Ensemble: directory for summary.txt (combined default: ./test_report); single epoch model: JSON file path (required)')
     parser.add_argument('--save_npz', action='store_true', help='With --output, save native-unit prediction arrays')
     parser.add_argument('--demo-only', action='store_true', help='Epoch model only: skip split-overlap audit for test-only demonstrations')
     args = parser.parse_args(argv)
@@ -317,14 +320,22 @@ def main(argv=None):
             parser.error('Ensemble weights and prediction protocol are fixed; omit legacy-only options')
         if args.seed is not None and args.seed != checkpoint['model_config']['seed']:
             parser.error('Use the seed saved in the ensemble checkpoint')
-        if args.workers not in (None, 0):
-            parser.error('Use --io-workers for the embedded epoch ensemble')
-        if args.io_workers < 0 or args.cache_frames < 0:
+        if args.workers is not None:
+            if args.io_workers is not None and args.io_workers != args.workers:
+                parser.error('--workers and --io-workers must agree when both are supplied')
+            args.io_workers = args.workers
+        if any(n is not None and n < 0 for n in (args.io_workers, args.cache_frames)):
             parser.error('I/O worker and cache counts must be nonnegative')
         if args.gpu_num is not None:
             os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_num
+        out = Path(args.output or './test_report')
+        if out.exists() and not out.is_dir():
+            parser.error('--output must name a directory for combined checkpoints')
+        defaults = dict(batch_size=64, threads=2, io_workers=1, cache_frames=4096)
+        defaults.update(checkpoint.get('evaluation_defaults', {}))
+        runtime = {key: defaults[key] if getattr(args, key) is None else getattr(args, key)
+                   for key in ('batch_size', 'threads', 'io_workers', 'cache_frames')}
         print('Running evaluation...', flush=True)
-        defaults = checkpoint.get('evaluation_defaults', {})
         with contextlib.ExitStack() as stack:
             quiet = stack.enter_context(open(os.devnull, 'w'))
             stack.enter_context(contextlib.redirect_stdout(quiet))
@@ -335,13 +346,9 @@ def main(argv=None):
                 progress_file = stack.enter_context(progress_path.open('w'))
                 progress = lambda line: print(line, file=progress_file, flush=True)
             text, reports = evaluate_bundle(checkpoint, args.data_dir, areas=args.areas,
-                device=args.device, batch_size=args.batch_size or defaults.get('batch_size', 64),
-                threads=args.threads or defaults.get('threads', 2),
-                io_workers=args.io_workers, cache_frames=args.cache_frames, progress=progress)
-        if args.output:
-            out = Path(args.output)
-            out.mkdir(parents=True, exist_ok=True)
-            (out / 'summary.txt').write_text(text, encoding='utf-8')
+                device=args.device, progress=progress, **runtime)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'summary.txt').write_text(text, encoding='utf-8')
         print(text, end='', flush=True)
         return reports
     is_paper = checkpoint.get('format') == FORMAT
