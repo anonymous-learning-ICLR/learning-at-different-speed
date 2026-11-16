@@ -450,7 +450,7 @@ def run_accelerated(training, argv=None):
                  row['epoch'], config['epochs'], *epoch_loss[0], val['ade_km'],
                  val['pressure_mae_hpa'], val['wind_mae_ms'], improved,
                  time.perf_counter() - epoch_started[0]))
-        emit('[TSI-UPDATE] alpha_track={:.6f}, alpha_intensity={:.6f}'.format(*row['alpha']))
+        emit('[FEEDBACK-UPDATE] alpha_track={:.6f}, alpha_intensity={:.6f}'.format(*row['alpha']))
         emit('[Saved] {}'.format(out / 'last.pt'))
         if improved:
             emit('[Saved] {} (new best validation ADE)'.format(out / 'best.pt'))

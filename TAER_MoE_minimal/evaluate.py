@@ -296,6 +296,9 @@ def main(argv=None):
     parser.add_argument('--num-samples', '--num_samples', type=int)
     parser.add_argument('--workers', '--loader_num_workers', type=int, default=None)
     parser.add_argument('--threads', type=int)
+    parser.add_argument('--io-workers', type=int, default=1, help='Embedded epoch ensemble: ordered reader threads')
+    parser.add_argument('--cache-frames', type=int, default=4096, help='Embedded epoch ensemble: bounded input cache')
+    parser.add_argument('--progress-log', help='Optional progress file for embedded epoch ensemble evaluation')
     parser.add_argument('--limit', type=int, help='Development only: first N windows per area')
     parser.add_argument('--output', '--output_dir', help='Legacy: directory for summary.txt; epoch model: JSON file path (required)')
     parser.add_argument('--save_npz', action='store_true', help='With --output, save native-unit prediction arrays')
@@ -308,6 +311,39 @@ def main(argv=None):
     if args.save_npz and not args.output:
         parser.error('--save_npz requires --output')
     checkpoint = load_checkpoint(args.checkpoint)
+    from meta_ensemble import FORMAT as META_FORMAT, evaluate_bundle
+    if checkpoint.get('format') == META_FORMAT:
+        if args.state_key != 'auto' or args.num_samples is not None or args.limit is not None or args.save_npz:
+            parser.error('Ensemble weights and prediction protocol are fixed; omit legacy-only options')
+        if args.seed is not None and args.seed != checkpoint['model_config']['seed']:
+            parser.error('Use the seed saved in the ensemble checkpoint')
+        if args.workers not in (None, 0):
+            parser.error('Use --io-workers for the embedded epoch ensemble')
+        if args.io_workers < 0 or args.cache_frames < 0:
+            parser.error('I/O worker and cache counts must be nonnegative')
+        if args.gpu_num is not None:
+            os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_num
+        print('Running evaluation...', flush=True)
+        defaults = checkpoint.get('evaluation_defaults', {})
+        with contextlib.ExitStack() as stack:
+            quiet = stack.enter_context(open(os.devnull, 'w'))
+            stack.enter_context(contextlib.redirect_stdout(quiet))
+            progress = None
+            if args.progress_log:
+                progress_path = Path(args.progress_log)
+                progress_path.parent.mkdir(parents=True, exist_ok=True)
+                progress_file = stack.enter_context(progress_path.open('w'))
+                progress = lambda line: print(line, file=progress_file, flush=True)
+            text, reports = evaluate_bundle(checkpoint, args.data_dir, areas=args.areas,
+                device=args.device, batch_size=args.batch_size or defaults.get('batch_size', 64),
+                threads=args.threads or defaults.get('threads', 2),
+                io_workers=args.io_workers, cache_frames=args.cache_frames, progress=progress)
+        if args.output:
+            out = Path(args.output)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / 'summary.txt').write_text(text, encoding='utf-8')
+        print(text, end='', flush=True)
+        return reports
     is_paper = checkpoint.get('format') == FORMAT
     if is_paper:
         if not args.output:

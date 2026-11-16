@@ -13,7 +13,7 @@ ORIGINAL_EPOCH_SOURCES = {'train_paper.py': '7ef146aa5c38176202a7856fa8f9ba06659
  'TCNM/env_net_transformer_gphsplit.py': '299b30bc8f591306bf4ff74a7681b22d11806749cfaf30fa3f3f82ef36ce3dcf',
  'TCNM/losses.py': '6255c5cf1e44ebf0ebcc2ce63aa72fdbc338d82f571a1d795239396682c589be'}
 
-CONSOLIDATED_SOURCES = {'train.py': '0afb2c1fe18b77b33e0d09b76f1aa5b409b67c9f25bb8be8dcb6981d0992749a',
+CONSOLIDATED_SOURCES = {'train.py': 'b1d66027b18db0b2487c67c1618a338244b43a9b2705b1d77d1f307becb5e3bd',
  'paper_pipeline.py': 'd02c01bf573d95380e8e59cc40ca945731a4b86cf3318c1e131c93c8017c5016',
  'taer_feedback.py': '1916fcd32a3a599df593ba9da145dd78184047d80bdf19c143602e07da4de04c',
  'TCNM/paper_model.py': '649113d0a16e130568d393ada49814d6236051bace01ad6422e02533782d3845',
@@ -24,9 +24,16 @@ CONSOLIDATED_SOURCES = {'train.py': '0afb2c1fe18b77b33e0d09b76f1aa5b409b67c9f25b
  'TCNM/losses.py': '6255c5cf1e44ebf0ebcc2ce63aa72fdbc338d82f571a1d795239396682c589be'}
 
 
+# The only training change in this migration is the feedback log label.
+PREVIOUS_LOG_SOURCES = dict(CONSOLIDATED_SOURCES, **{
+    'train.py': '0afb2c1fe18b77b33e0d09b76f1aa5b409b67c9f25bb8be8dcb6981d0992749a',
+    'checkpoint_compat.py': '563075af2db237b52b047df8b856573b8b694d308d106c4b58e9e1ac3b5d25a4',
+})
+
+
 def compatible_sources(saved, current):
     if saved == current:
         return True
-    return (saved == ORIGINAL_EPOCH_SOURCES
+    return (saved in (ORIGINAL_EPOCH_SOURCES, PREVIOUS_LOG_SOURCES)
             and set(current) == set(CONSOLIDATED_SOURCES) | {'checkpoint_compat.py'}
             and all(current.get(name) == digest for name, digest in CONSOLIDATED_SOURCES.items()))

@@ -13,6 +13,7 @@ All runnable components are in `TAER_MoE_minimal/`:
 | `train.py` | Single training entry; epoch-based training with optional input acceleration and progress logging |
 | `paper_pipeline.py`, `taer_feedback.py` | Training objective, expert-task statistics, and routing feedback |
 | `evaluate.py` | Single evaluation entry; automatically detects the new or bundled checkpoint format |
+| `meta.py`, `meta_ensemble.py` | Fit per-area fusion and export embedded epoch models into a single `ckpt.pt` |
 | `visualize.py` | Generate the four data visualization outputs |
 | `TCNM/` | Model architectures, data loaders, losses, and utilities |
 | `install.sh` | Python dependency installation |
@@ -178,6 +179,41 @@ python -m unittest discover -s tests -v
 ```
 
 These cover routing feedback, expert-task statistics, data handling, model gradients, saving/resuming training, evaluation, and input-pipeline consistency. Full training requires the separately authorized data.
+
+## Build and test a combined checkpoint
+
+`meta.py` combines checkpoints from the current epoch-model architecture. It reads the numbered `checkpoint_with_model_*.pt` snapshots plus `best.pt` and `last.pt`, freezes their contents at startup, and removes exact duplicate model states. It does not modify those files or wait for an ongoing training run to finish. The resulting `ckpt.pt` includes all member parameters, saved routing buffers, input settings, and per-area fusion coefficients. Original checkpoint paths are not required for testing.
+
+For each basin, longitude and latitude use nonnegative linear regression without an intercept; pressure and wind use Ridge regression with `alpha=1.0`, matching the historical fusion recipe. The current model produces deterministic task/expert mixtures, so the old architecture's ground-truth Best-of-K selection is not used. This is a prediction ensemble stored in one file, not an average of network parameters.
+
+To explicitly reproduce the historical **test-fit/test-evaluation** protocol:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u meta.py \
+  --checkpoint-dir /path/to/runs/full_seed200_bs64_ep101 \
+  --data-root /path/to/TropiCycloneNet1 \
+  --output ./runs/seed200_combined/ckpt.pt \
+  --fit-split test \
+  --areas EP NA NI SI SP WP \
+  --device cuda --batch-size 64 --threads 2 --io-workers 2
+```
+
+This protocol fits coefficients using test labels, so the reported errors are not independent held-out test estimates. The checkpoint records this choice. For separate calibration, use `--fit-split val` instead; this is the default when the option is omitted. Fitting checks the existing train/val/test split manifests. Scikit-learn and SciPy are needed for fitting and are included in `install.sh`; inference applies the stored coefficients without either package.
+
+Test using only the combined checkpoint and evaluation data:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u evaluate.py \
+  --checkpoint ./runs/seed200_combined/ckpt.pt \
+  --data-root /path/to/TropiCycloneNet1 \
+  --areas EP NA NI SI SP WP \
+  --device cuda --batch-size 64 --threads 2 --io-workers 2 \
+  --output ./runs/seed200_combined/eval_report
+```
+
+For CPU execution, use `--device cpu`. Testing never fits new coefficients or updates routing feedback. It prints an initial running message followed by `GLOBAL (N=...)` and the EP, NA, NI, SI, SP, WP tables, with ADE/FDE, per-step TDE/pressure/wind errors, and AVG. `eval_report/summary.txt` contains the same tables. GLOBAL aggregates actual windows and valid timesteps across the selected basins. Optional `--progress-log /path/to/progress.log` writes progress separately without adding console messages.
+
+The combined checkpoint has format `taer-paper-meta-ensemble-v1`; `evaluate.py` detects it automatically alongside the two previously supported formats. New training snapshots require a new fusion build to be included. Existing output checkpoint files are not overwritten.
 
 ## Planned data release
 
