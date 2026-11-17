@@ -1,6 +1,6 @@
 # TAER-MoE
 
-Tropical cyclone implementation of TAER-MoE, with training code, a pretrained single-model checkpoint, a test example, and a separate visualization example.
+Tropical cyclone implementation of TAER-MoE, with training code, a model checkpoint, a test example, and a separate visualization example.
 
 ## Release contents
 
