@@ -1,28 +1,18 @@
-"""Epoch-based TC training with task/expert feedback and optional input acceleration."""
+"""Train the explicitly reconstructed Eq. (3)-(9) TC implementation."""
 import argparse
 import json
-import os
-import random
 from pathlib import Path
-import numpy as np
 import torch
 from paper_pipeline import (FORMAT, seed_all, make_model, make_dataset, loader,
     split_manifest, unpack_batch, absolute_outputs, objective, collect_statistics,
     load_checkpoint, jsonable, source_hashes)
 from taer_feedback import FeedbackController, VARIANTS
-from checkpoint_compat import compatible_sources
-import builtins
-import copy
-import logging
-import sys
-import time
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from functools import lru_cache
-from unittest.mock import patch
-import paper_pipeline
-from TCNM.data import paper_data
+from training_checkpoints import (CheckpointWriter, compatible_sources, rng_state, restore_rng,
+                                  atomic_save, freeze)
+
+# Kept separate so progress logging distinguishes interval validation from the
+# three epoch-end passes. Interval validation never updates the controller.
+validate_for_checkpoint = collect_statistics
 
 
 def parser():
@@ -34,7 +24,7 @@ def parser():
     p.add_argument('--variant', choices=VARIANTS, default='full')
     p.add_argument('--seed', type=int, default=100)
     p.add_argument('--areas', nargs='+', default=['EP', 'NA', 'NI', 'SI', 'SP', 'WP'])
-    p.add_argument('--epochs', type=int, default=100)
+    p.add_argument('--epochs', '--num_epochs', type=int, default=101)
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--workers', type=int, default=0)
     p.add_argument('--threads', type=int, default=2)
@@ -58,16 +48,32 @@ def parser():
                    help='legacy exactly matches TC3 timestamp.npy lookup and zero/partial fallback')
     p.add_argument('--feature-reduction', choices=['none', 'spatial_mean'], default='none',
                    help='Only available with --feature-mode strict; legacy never pools spatial maps')
-    p.add_argument('--resume', help='Resume an epoch-boundary last.pt from this implementation')
+    p.add_argument('--checkpoint-every', '--checkpoint_every', type=int, default=3000)
+    p.add_argument('--resume', help='Resume last.pt or a numbered training checkpoint')
     p.add_argument('--preflight-only', action='store_true')
     return p
 
 
-def train_epoch(model, batches, optimizer, config, device):
+def train_epoch(model, batches, optimizer, config, device, progress=None,
+                on_batch=None, resume_rng=None):
     model.train()
-    totals = torch.zeros(2, dtype=torch.float64)
-    count = 0
-    for batch in batches:
+    progress = progress if progress is not None else {}
+    totals = torch.as_tensor(progress.get('train_totals', [0., 0.]), dtype=torch.float64).clone()
+    count = progress.get('train_count', 0)
+    skipped = progress.get('batch_in_epoch', 0)
+    iterator = iter(batches)
+    # Reconstruct the original shuffled epoch using its saved loader seed.
+    # These batches are only read; no model/optimizer updates are repeated.
+    for _ in range(skipped):
+        next(iterator)
+    if resume_rng is not None:
+        restore_rng(resume_rng)
+    if skipped and progress.get('global_step', 0) >= progress.get('total_steps', float('inf')):
+        if skipped == len(batches):
+            # Complete the sampler's normal end-of-epoch RNG bookkeeping.
+            next(iterator, None)
+        return (totals / count).tolist()
+    for batch_index, batch in enumerate(iterator, skipped + 1):
         inputs, target, mask = unpack_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         result = model(*inputs)
@@ -81,6 +87,12 @@ def train_epoch(model, batches, optimizer, config, device):
         optimizer.step()
         totals += tasks.detach().double().cpu() * target.shape[1]
         count += target.shape[1]
+        progress.update(batch_in_epoch=batch_index, train_totals=totals.tolist(), train_count=count,
+                        global_step=progress.get('global_step', 0) + 1)
+        if on_batch is not None:
+            on_batch(progress)
+        if progress['global_step'] >= progress.get('total_steps', float('inf')) and batch_index < len(batches):
+            break
     if not count:
         raise ValueError('Empty training loader')
     return (totals / count).tolist()
@@ -93,6 +105,8 @@ def run_training(args=None):
         raise ValueError('Invalid training settings')
     if c['beta_load'] < 0 or c['beta_reg'] < 0 or c['weight_decay'] < 0:
         raise ValueError('Regularization coefficients must be nonnegative')
+    if c['checkpoint_every'] < 1:
+        raise ValueError('checkpoint_every must be positive')
     if c['feature_mode'] == 'legacy' and c['feature_reduction'] != 'none':
         raise ValueError('Use --feature-reduction none for legacy feature parity')
     torch.set_num_threads(c['threads'])
@@ -104,17 +118,24 @@ def run_training(args=None):
     generator = torch.Generator().manual_seed(c['seed'])
     batches = loader(train_data, c, True, generator)
     train_probe, val_probe = loader(train_data, c), loader(val_data, c)
+    # Match train_github.py exactly: floor the fractional batch count * epochs,
+    # rather than ceil(dataset/batch_size) * epochs.
+    total_steps = int(len(train_data) / c['batch_size'] * c['epochs'])
+    if total_steps < 1:
+        raise ValueError('Training sample/batch/epoch settings produce zero total steps')
     model = make_model(c).to(device)
     control = FeedbackController(experts=c['experts'], variant=c['variant'], window=c['window'],
                                  ema=c['ema'], tau_u=c['tau_u'], alpha_min=c['alpha_min'],
                                  alpha_max=c['alpha_max'], gamma=c['gamma'], tau_r=c['tau_r'])
     control.apply(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['weight_decay'])
-    epoch0, best = 0, float('inf')
+    epoch0, best, global_step = 0, float('inf'), 0
+    saved, partial = None, None
     hashes = source_hashes()
     if args.resume:
         saved = load_checkpoint(args.resume)
-        mutable = {'epochs', 'resume', 'output_dir', 'data_root', 'device', 'threads', 'preflight_only'}
+        mutable = {'epochs', 'resume', 'output_dir', 'data_root', 'device', 'threads',
+                   'preflight_only', 'checkpoint_every'}
         for key, value in c.items():
             old_default = {'feature_mode': 'strict', 'split_policy': 'paper_years'}.get(key)
             if key not in mutable and saved['config'].get(key, old_default) != value:
@@ -126,18 +147,33 @@ def run_training(args=None):
         control.apply(model)
         optimizer.load_state_dict(saved['optimizer'])
         epoch0, best = saved['epoch'], saved['best_score']
-        random.setstate(saved['rng']['python'])
-        np.random.set_state(saved['rng']['numpy'])
-        torch.set_rng_state(saved['rng']['torch'])
-        if torch.cuda.is_available() and saved['rng']['cuda'] is not None:
-            torch.cuda.set_rng_state_all(saved['rng']['cuda'])
-        generator.set_state(saved['rng']['loader'])
+        global_step = saved.get('global_step', epoch0 * len(batches))
+        restore_rng(saved['rng'], generator)
+        if saved.get('progress', {}).get('phase') == 'training':
+            partial = dict(saved['progress'])
+            epoch0 -= 1
+        if total_steps < global_step:
+            raise ValueError('Configured total steps are below the resumed global step')
     out = Path(c['output_dir'])
     out.mkdir(parents=True, exist_ok=True)
     if (out / 'last.pt').exists() and not args.resume:
         raise FileExistsError('Run already exists; use a new directory or --resume')
+    if saved is not None and not (out / 'best.pt').exists():
+        # Carry the best weights when continuing in a new directory. Never claim
+        # a historical best score without retaining the corresponding weights.
+        source_best = Path(args.resume).resolve().parent / 'best.pt'
+        candidate = load_checkpoint(source_best) if source_best.exists() else saved
+        if (candidate['selected_state_val']['metrics']['ade_km'] != best or
+                candidate['config']['seed'] != c['seed'] or candidate['manifest'] != manifest):
+            raise ValueError('The matching historical best.pt is required to resume in a new directory')
+        atomic_save(freeze(candidate), out / 'best.pt')
     (out / 'config.json').write_text(json.dumps(c, indent=2))
     (out / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+    writer = CheckpointWriter(out, best, saved.get('best_record') if saved else None)
+    print(json.dumps(dict(event='training_plan', train_windows=len(train_data),
+                          batch_size=c['batch_size'], epochs=c['epochs'],
+                          total_steps=total_steps, completed_steps=global_step,
+                          checkpoint_every=c['checkpoint_every'])), flush=True)
     if args.preflight_only:
         inputs, target, mask = unpack_batch(next(iter(train_probe)), device)
         model.eval()
@@ -149,7 +185,42 @@ def run_training(args=None):
                               prediction_shape=list(pred.shape), loss=float(loss.detach()))))
         return
     for epoch in range(epoch0 + 1, c['epochs'] + 1):
-        train_loss = train_epoch(model, batches, optimizer, c, device)
+        if global_step >= total_steps and partial is None:
+            break
+        if partial is not None:
+            progress = partial
+            generator.set_state(progress['epoch_start_loader_rng'])
+            resume_rng = saved['rng']
+            print(json.dumps(dict(event='resume_position', epoch=epoch,
+                                  skip_batches=progress['batch_in_epoch'], global_step=global_step)), flush=True)
+        else:
+            progress = dict(batch_in_epoch=0, train_totals=[0., 0.], train_count=0,
+                            epoch_start_loader_rng=generator.get_state().clone())
+            resume_rng = None
+        progress.update(phase='training', global_step=global_step, total_steps=total_steps)
+
+        def snapshot(stats):
+            return dict(format=FORMAT, config=c, sources=hashes, manifest=manifest,
+                        model=model.state_dict(), controller=control.state_dict(),
+                        optimizer=optimizer.state_dict(), epoch=epoch,
+                        global_step=progress['global_step'], total_steps=total_steps,
+                        progress=progress, selected_state_val=jsonable(stats),
+                        rng=rng_state(generator))
+
+        def checkpoint_batch(position):
+            step = position['global_step']
+            if step % c['checkpoint_every']:
+                return
+            stats = validate_for_checkpoint(model, val_probe)
+            improved = writer.save(snapshot(stats), archive=True)
+            print(json.dumps(dict(event='checkpoint', epoch=epoch, global_step=step,
+                                  total_steps=total_steps, best=improved, best_score=writer.best_score,
+                                  val=stats['metrics'])), flush=True)
+
+        train_loss = train_epoch(model, batches, optimizer, c, device, progress=progress,
+                                 on_batch=checkpoint_batch, resume_rng=resume_rng)
+        global_step = progress['global_step']
+        partial = None
         # Same parameters and preceding controller state for both panels.
         train_stats = collect_statistics(model, train_probe)
         val_stats = collect_statistics(model, val_probe)
@@ -158,29 +229,31 @@ def run_training(args=None):
         control.apply(model)  # Commit BOTH new signals only after both complete passes.
         # Score the EXACT state we save, including its updated routing bias.
         selected_stats = collect_statistics(model, val_probe)
-        score = selected_stats['metrics']['ade_km']
-        improved = score < best
-        best = min(best, score)
         row = dict(epoch=epoch, train_loss=train_loss, preceding_alpha=old_alpha,
                    preceding_penalty=old_penalty, train_stats=train_stats, val_stats=val_stats,
                    feedback=feedback, selected_state_val=selected_stats)
         with (out / 'feedback.jsonl').open('a') as f:
             f.write(json.dumps(jsonable(row), allow_nan=False) + '\n')
-        state = dict(format=FORMAT, config=c, sources=hashes, manifest=manifest,
-                     model=model.state_dict(), controller=control.state_dict(),
-                     optimizer=optimizer.state_dict(), epoch=epoch, best_score=best,
-                     selected_state_val=jsonable(selected_stats),
-                     rng=dict(python=random.getstate(), numpy=np.random.get_state(),
-                              torch=torch.get_rng_state(),
-                              cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-                              loader=generator.get_state()))
-        torch.save(state, out / 'last.tmp')
-        os.replace(out / 'last.tmp', out / 'last.pt')
-        if improved:
-            torch.save(state, out / 'best.pt')
+        progress['phase'] = 'epoch_end'
+        improved = writer.save(snapshot(selected_stats))
         print(json.dumps(dict(epoch=epoch, variant=c['variant'], alpha=feedback['alpha'],
-                              val=selected_stats['metrics']), allow_nan=False), flush=True)
+                              global_step=global_step, total_steps=total_steps, best=improved,
+                              best_score=writer.best_score, val=selected_stats['metrics']), allow_nan=False), flush=True)
 
+
+
+import builtins
+import copy
+import logging
+import sys
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from functools import lru_cache
+from unittest.mock import patch
+import paper_pipeline
+from TCNM.data import paper_data
 
 
 @contextmanager
@@ -351,6 +424,7 @@ def run_accelerated(training, argv=None):
     emit = logger.info
     original_train = training.train_epoch
     original_collect = training.collect_statistics
+    original_interval_collect = training.validate_for_checkpoint
     original_dataset = training.make_dataset
     original_objective = training.objective
     original_load = training.load_checkpoint
@@ -383,7 +457,9 @@ def run_accelerated(training, argv=None):
     def load(path):
         saved = original_load(path)
         epoch[0], best[0] = saved['epoch'], saved['best_score']
-        emit('[Resume] Read {}; completed epoch {}; best validation ADE={:.6f} km'.format(
+        if saved.get('progress', {}).get('phase') == 'training':
+            epoch[0] -= 1
+        emit('[Resume] Read {}; completed epochs {}; best validation ADE={:.6f} km'.format(
             path, epoch[0], best[0]))
         return saved
 
@@ -394,6 +470,8 @@ def run_accelerated(training, argv=None):
         return loss, tasks
 
     def loss_detail():
+        if current_loss[0] is None:
+            return 'restoring data order (no optimizer update)'
         loss, tasks = current_loss[0]
         return 'loss={:.6f}, track_loss={:.6f}, intensity_loss={:.6f}'.format(
             float(loss), float(tasks[0]), float(tasks[1]))
@@ -405,10 +483,11 @@ def run_accelerated(training, argv=None):
         emit('[Data] {}: {} windows in {:.1f}s'.format(split, len(result), time.perf_counter() - started))
         return result
 
-    def train(model, batches, optimizer, config, device):
+    def train(model, batches, optimizer, config, device, **kwargs):
         # Use the actual parameter device, not just the command-line request.
         epoch[0] += 1
         statistic[0] = 0
+        current_loss[0] = None
         epoch_started[0] = time.perf_counter()
         if not device_logged[0]:
             actual = next(model.parameters()).device
@@ -423,7 +502,7 @@ def run_accelerated(training, argv=None):
             float(model.gap_gamma), float(model.gap_penalty.max())))
         wrapped = ProgressBatches(batches, 'Train {}/{}'.format(epoch[0], config['epochs']),
                                   extra.log_every, emit, loss_detail)
-        result = original_train(model, wrapped, optimizer, config, device)
+        result = original_train(model, wrapped, optimizer, config, device, **kwargs)
         epoch_loss[0] = result
         return result
 
@@ -433,6 +512,10 @@ def run_accelerated(training, argv=None):
         statistic[0] += 1
         return original_collect(model, ProgressBatches(batches, label, extra.log_every, emit))
 
+    def interval_collect(model, batches):
+        return original_interval_collect(model, ProgressBatches(
+            batches, 'Checkpoint validation (epoch {})'.format(epoch[0]), extra.log_every, emit))
+
     def summary(*values, **kwargs):
         # Only replace the driver's final epoch print, after its checkpoint saves.
         # feedback.jsonl and all serialized checkpoint fields stay untouched.
@@ -440,11 +523,30 @@ def run_accelerated(training, argv=None):
             row = json.loads(values[0]) if len(values) == 1 and isinstance(values[0], str) else None
         except (TypeError, ValueError):
             row = None
+        if isinstance(row, dict) and row.get('event') == 'training_plan':
+            emit('[Plan] {} training windows | batch_size={} | epochs={} | total_steps={} | '
+                 'completed_steps={} | checkpoint_every={}'.format(
+                     row['train_windows'], row['batch_size'], row['epochs'], row['total_steps'],
+                     row['completed_steps'], row['checkpoint_every']))
+            return
+        if isinstance(row, dict) and row.get('event') == 'resume_position':
+            emit('[Resume] Restoring epoch {} data order; skipping {} completed batches; global_step={}'.format(
+                row['epoch'], row['skip_batches'], row['global_step']))
+            return
+        if isinstance(row, dict) and row.get('event') == 'checkpoint':
+            best[0] = row['best_score']
+            emit('[Checkpoint] step {}/{} | validation ADE={:.6f} km | best={}'.format(
+                row['global_step'], row['total_steps'], row['val']['ade_km'], row['best']))
+            emit('[Saved] {}'.format(out / 'checkpoint_with_model_{:05d}.pt'.format(row['global_step'])))
+            emit('[Saved] {}'.format(out / 'last.pt'))
+            if row['best']:
+                emit('[Saved] {} | {}'.format(out / 'best.pt', out / 'best.txt'))
+            return
         if not isinstance(row, dict) or not {'epoch', 'alpha', 'val'}.issubset(row):
             return builtins.print(*values, **kwargs)
         val = row['val']
-        improved = val['ade_km'] < best[0]
-        best[0] = min(best[0], val['ade_km'])
+        improved = row.get('best', val['ade_km'] < best[0])
+        best[0] = row.get('best_score', min(best[0], val['ade_km']))
         emit('[Epoch {}/{}] track_loss={:.6f}, intensity_loss={:.6f}, '
              'ADE={:.4f} km, pressure={:.4f} hPa, wind={:.4f} m/s, best={}, seconds={:.1f}'.format(
                  row['epoch'], config['epochs'], *epoch_loss[0], val['ade_km'],
@@ -472,6 +574,7 @@ def run_accelerated(training, argv=None):
              patch.object(paper_pipeline, 'unpack_batch', transfer), \
              patch.object(training, 'train_epoch', train), \
              patch.object(training, 'collect_statistics', collect), \
+             patch.object(training, 'validate_for_checkpoint', interval_collect), \
              patch.object(training, 'objective', objective), \
              patch.object(training, 'load_checkpoint', load), \
              patch.object(training, 'print', summary, create=True):
@@ -482,6 +585,7 @@ def run_accelerated(training, argv=None):
         for handler in (console, logfile):
             logger.removeHandler(handler)
             handler.close()
+
 
 
 def main(argv=None):
