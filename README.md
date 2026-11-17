@@ -61,20 +61,41 @@ The script prints aggregate and regional error tables and saves `test_report/sum
 
 The bundled example contains four windows from one storm. Its scores describe that example, not the full benchmark. To evaluate another compatible dataset, set `--data-dir` to its root and optionally select basins with `--areas EP NA NI SI SP WP`.
 
-## Visualize the example data
+## Data visualization
+
+The repository includes rendered examples in [`TAER_MoE_minimal/visualizations/`](TAER_MoE_minimal/visualizations/). You can view them below without running the code.
+
+To regenerate the figures from the bundled Meranti data, run the following command from `TAER_MoE_minimal/`:
 
 ```bash
 python visualize.py --data-dir data_demo --output visualizations
 ```
 
-This generates four files:
+The command produces one CSV table and three PNG images. It runs on CPU and does not require the pretrained checkpoint.
 
-- `visualizations/data_1d.csv` — tabulated storm data.
-- `visualizations/environment_3d.png` — environmental-field visualization.
-- `visualizations/features6.png` — six-channel feature visualization.
-- `visualizations/features10.png` — ten-channel feature visualization.
+### Storm observations and targets
 
-These outputs visualize the supplied data. The visualization command does not require the checkpoint.
+[View or download the storm data table](TAER_MoE_minimal/visualizations/data_1d.csv). It contains timestamps, longitude, latitude, pressure, and wind speed, with observation and future-target rows identified separately.
+
+### Environmental field sequence
+
+The figure stacks eight observed GPH500 fields along the time axis. The vertical axis represents elapsed time at a single pressure level.
+
+![Meranti GPH500 environmental field sequence](TAER_MoE_minimal/visualizations/environment_3d.png)
+
+### Six-channel feature maps
+
+Spatial maps of the six stored feature channels at the final observation time.
+
+![Meranti six-channel feature maps](TAER_MoE_minimal/visualizations/features6.png)
+
+### Ten-channel feature maps
+
+Spatial maps of the ten stored feature channels at the final observation time.
+
+![Meranti ten-channel feature maps](TAER_MoE_minimal/visualizations/features10.png)
+
+These figures visualize the supplied data. Model evaluation is performed separately with `test.py`.
 
 ## Train
 
@@ -123,3 +144,4 @@ At each epoch-end feedback update, the training loop collects training and valid
 The training loop calls `control.update(...)` followed by `control.apply(model)`. This calls `model.set_feedback(...)`. Task weights affect the training objective, and routing penalties enter the task-specific softmax logits. Feedback signals are detached from gradient computation and saved in checkpoints. Interval validation for checkpoint selection does not update the controller.
 
 The current training path uses the feedback controller. The legacy TSI interface is not used for these updates.
+
