@@ -1,2 +1,1 @@
-TAER_MoE_minimal/seed3047ckpt.pt filter=lfs diff=lfs merge=lfs -text
 TAER_MoE_minimal/ckpt.pt filter=lfs diff=lfs merge=lfs -text

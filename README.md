@@ -31,7 +31,7 @@ For GPU 0, replace `--device cpu` with `--device cuda --gpu_num 0`.
 
 The script prints only ALL and regional error tables, also saved to `demo_results/summary.txt`. The bundled example contains one WP test window.
 
-The supplied checkpoint is an ensemble with fusion fitted on test labels; evaluation uses true future tracks for Best-of-K selection, so these are oracle demo scores, not independent held-out results.
+The supplied checkpoint uses test-label calibration and true-future candidate selection. These demo scores are not independent held-out results.
 
 ## Visualize
 

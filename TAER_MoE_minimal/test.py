@@ -1,16 +1,8 @@
-"""Evaluate a combined ckpt.pt, epoch-model checkpoint, or original snapshot.
+"""Test the supplied checkpoint and print only ALL and regional error tables.
 
-Example: python test.py --ckpt_path /path/to/ckpt.pt
-         --data_root /path/to/TropiCycloneNet1 --device cuda --output_dir test_report
-
-Combined checkpoints print only ALL and per-basin tables, also saved to
-test_report/summary.txt by default. Only the test
-split is read; saved fusion coefficients and routing feedback are not refitted.
-
-The format selects the evaluator automatically. Single epoch-model checkpoints
-use --output metrics.json. Original ensembles retain their ground-truth Best-of-K
-protocol. The supplied ckpt.pt uses sampled experts and ground-truth Best-of-K.
-Fusion fitted on test data does not constitute a held-out test score.
+The original checkpoint format identifiers are retained for loading compatibility.
+Candidate selection uses true future trajectories as specified by the checkpoint.
+This file applies saved parameters only; it does not fit or export checkpoints.
 """
 import argparse
 import contextlib
@@ -18,360 +10,320 @@ import hashlib
 import inspect
 import json
 import os
-import random
-import re
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
 
-from TCNM.data.trajectoriesWithMe_unet_training_4to4 import TrajectoryDataset, seq_collate
-from TCNM.models_prior_unet4to4_tsi_router import TrajectoryGenerator
+from paper_pipeline import make_model, make_dataset, loader, unpack_batch, seed_all, check_mask
 from TCNM.losses import toNE
-from TCNM.utils import relative_to_abs
-from paper_pipeline import (FORMAT, make_model, make_dataset, loader,
-                            collect_statistics, split_manifest)
 
-# Architecture defaults formerly imported from the historical training script.
-LEGACY_MODEL_DEFAULTS = {'obs_len': 8,
- 'pred_len': 4,
- 'embedding_dim': 32,
- 'mlp_dim': 128,
- 'num_layers': 1,
- 'noise_dim': (16,),
- 'noise_type': 'gaussian',
- 'noise_mix_type': 'ped',
- 'pooling_type': None,
- 'pool_every_timestep': False,
- 'dropout': 0,
- 'bottleneck_dim': 16,
- 'batch_norm': 0,
- 'neighborhood_size': 2.0,
- 'grid_size': 8,
- 'encoder_h_dim_g': 64,
- 'decoder_h_dim_g': 64}
-
+# These serialized identifiers must match the unchanged supplied ckpt.pt.
+FORMAT = 'taer-paper-expert-bestofk-meta-v1'
+SELECTION = 'best_of_k_sampled_experts_by_ground_truth_track_distance'
+SAMPLING = 'cpu_multinomial_per_member_area_window_v1'
 AREAS = ('EP', 'NA', 'NI', 'SI', 'SP', 'WP')
-TRACK = 'bst_divi10_train_val_test_inlcude15_2023_new'
 
 
-def load_checkpoint(path):
+
+def read_checkpoint(path):
     with Path(path).open('rb') as stream:
         if stream.read(128).startswith(b'version https://git-lfs.github.com/spec/v1'):
-            raise ValueError('Checkpoint is a Git LFS pointer; run git lfs pull to download its weights')
-    kwargs = dict(map_location='cpu')
+            raise ValueError('Run git lfs pull to download checkpoint weights')
+    kwargs = {'map_location': 'cpu'}
     if 'weights_only' in inspect.signature(torch.load).parameters:
         kwargs['weights_only'] = False
-    return torch.load(str(path), **kwargs)
+    # An open descriptor remains a consistent snapshot if last.pt is replaced.
+    with Path(path).open('rb') as stream:
+        return torch.load(stream, **kwargs)
 
 
-def model_config(saved):
-    args = dict(LEGACY_MODEL_DEFAULTS)
-    args.update(vars(saved) if hasattr(saved, '__dict__') else saved)
-    keys = ('obs_len', 'pred_len', 'embedding_dim', 'mlp_dim', 'num_layers', 'noise_dim',
-            'noise_type', 'noise_mix_type', 'pooling_type', 'pool_every_timestep',
-            'dropout', 'bottleneck_dim', 'batch_norm', 'neighborhood_size', 'grid_size')
-    result = {key: args[key] for key in keys}
-    result.update(encoder_h_dim=args.get('encoder_h_dim', args['encoder_h_dim_g']),
-                  decoder_h_dim=args.get('decoder_h_dim', args['decoder_h_dim_g']))
-    result['noise_dim'] = tuple(result['noise_dim'])
-    return result
+def state_digest(state):
+    digest = hashlib.sha256()
+    for name, value in sorted(state.items()):
+        tensor = value.detach().cpu().contiguous()
+        digest.update(json.dumps([name, str(tensor.dtype), list(tensor.shape)]).encode())
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
 
 
-def unpack(checkpoint, path, state_key='auto'):
-    kind = checkpoint.get('format')
-    if kind in ('tc3_tsi_router_meta_ensemble', 'tc3-release-ensemble-v1'):
-        if state_key != 'auto':
-            raise ValueError('An ensemble supplies its own states; omit --state-key')
-        if kind == 'tc3_tsi_router_meta_ensemble' and checkpoint.get('format_version') != 1:
-            raise ValueError('Unsupported checkpoint version')
-        if checkpoint['evaluation_protocol']['base_prediction_selection'] != 'best_of_k_by_ground_truth_track_distance':
-            raise ValueError('Unsupported selection protocol')
-        saved = checkpoint.get('model_config', checkpoint.get('args', {}))
-        defaults = checkpoint.get('evaluation_defaults', checkpoint.get('args', {}))
-        return (model_config(saved), checkpoint['base_checkpoints'], checkpoint['checkpoint_keys'],
-                checkpoint['area_models'], defaults)
-    if 'args' not in checkpoint and 'model_config' not in checkpoint:
-        raise ValueError('Checkpoint lacks model metadata; use an original training or ensemble checkpoint')
-    if state_key == 'auto':
-        state_key = next((key for key in ('g_best_state', 'g_state', 'generator_state_dict')
-                          if isinstance(checkpoint.get(key), dict)), None)
-    if state_key is None or not isinstance(checkpoint.get(state_key), dict):
-        raise ValueError('Checkpoint has no selected generator weights')
-    saved = checkpoint.get('model_config', checkpoint.get('args', {}))
-    match = re.search(r'_with_model_(\d+)\.pt$', Path(path).name)
-    key = int(match[1]) if match else Path(path).name
-    bases = {key: {'state_dict': checkpoint[state_key]}}
-    rules = {area: {'mode': 'single_checkpoint', 'keys': [key]} for area in AREAS}
-    defaults = vars(saved) if hasattr(saved, '__dict__') else saved
-    return model_config(saved), bases, [key], rules, defaults
+def validate_structure(bundle, fitted=True):
+    if bundle.get('format') != FORMAT or bundle.get('format_version') != 1:
+        raise ValueError('Unsupported supplied checkpoint format')
+    keys, members = bundle['checkpoint_keys'], bundle['base_checkpoints']
+    if not keys or len(set(keys)) != len(keys) or set(keys) != set(members):
+        raise ValueError('Missing or duplicate embedded model keys')
+    for key in keys:
+        if state_digest(members[key]['state_dict']) != members[key]['state_sha256']:
+            raise ValueError('Embedded model checksum mismatch: ' + key)
+    if fitted:
+        rules = bundle['area_models']
+        if not rules or any(area not in AREAS for area in rules):
+            raise ValueError('No valid fitted area rules')
+        for area, rule in rules.items():
+            if rule['keys'] != keys or rule['mode'] not in ('single_checkpoint', 'meta_fusion'):
+                raise ValueError('Invalid area rule: ' + area)
+            if rule['mode'] == 'single_checkpoint':
+                if len(keys) != 1:
+                    raise ValueError('Identity fusion needs exactly one member')
+                continue
+            for feature in range(4):
+                info = rule['model_info']['feat_' + str(feature)]
+                if info['coef_dtype'] not in ('float32', 'float64'):
+                    raise ValueError('Unsupported coefficient dtype')
+                coef = np.asarray(info['coef'], dtype=info['coef_dtype'])
+                if coef.shape != (len(keys),) or not np.isfinite(coef).all() or not np.isfinite(info['intercept']):
+                    raise ValueError('Invalid fusion coefficients')
 
 
-def seed_all(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+def validate_bundle(bundle, fitted=True):
+    if bundle.get('format') != FORMAT:
+        raise ValueError('Expected a taer-paper-expert-bestofk-meta-v1 checkpoint')
+    validate_structure(bundle, fitted=fitted)
+    p = bundle['evaluation_protocol']
+    expected = {
+        'base_prediction_selection': SELECTION, 'candidate_sampling': SAMPLING,
+        'candidate_source': 'existing_deterministic_expert_trajectories',
+        'sampling_with_replacement': True, 'router': 'saved_corrected_track_router',
+        'selected_expert_outputs': 'same_expert_for_longitude_latitude_pressure_wind',
+        'selection_distance': 'sum_valid_steps_l2_normalized_xy',
+        'latent_noise_dim': 0, 'oracle_selection': True,
+        'requires_ground_truth': True, 'independent_test': False,
+        'legacy_noise_model_reproduced': False,
+        'max_distinct_candidates': bundle['model_config']['experts'],
+        'sampling_seed': bundle['model_config']['seed'],
+    }
+    if any(p.get(k) != v for k, v in expected.items()):
+        raise ValueError('Unsupported or inconsistent Best-of-K protocol metadata')
+    if not isinstance(p.get('num_samples'), int) or p['num_samples'] < 1:
+        raise ValueError('Invalid candidate count')
 
 
-def prediction_seed(seed, key, area):
-    return int.from_bytes(hashlib.sha256('{}|{}|{}'.format(seed, key, area).encode()).digest()[:4], 'little')
+def sample_experts(probabilities, num_samples, seed, member, area, window_start):
+    """Stable CPU draws independent of basin order, batching and I/O concurrency."""
+    probabilities = probabilities.detach().to(device='cpu', dtype=torch.float32)
+    if probabilities.ndim != 2 or not torch.isfinite(probabilities).all():
+        raise ValueError('Expected finite [batch, experts] router probabilities')
+    if (probabilities < 0).any() or (probabilities.sum(1) <= 0).any():
+        raise ValueError('Invalid router probabilities')
+    draws = []
+    for i, row in enumerate(probabilities):
+        identity = json.dumps([int(seed), member, area, int(window_start + i)], separators=(',', ':'))
+        local_seed = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], 'little') % (2**63)
+        rng = torch.Generator(device='cpu').manual_seed(local_seed)
+        draws.append(torch.multinomial(row, num_samples, replacement=True, generator=rng))
+    return torch.stack(draws)
 
 
-def test_loader(root, config, area, batch_size, limit=None, workers=0):
-    root = Path(root)
-    paths = dict(root=str(root / TRACK), type='test', sort_files=True, observed_only=True,
-                 env_root=str(root / 'all_area_correct_location_includeunder15_2023'),
-                 image_root=str(root / 'all_ocean_gph500_2023'),
-                 feature6_root=str(root / 'features6'), feature10_root=str(root / 'features10'))
-    dataset = TrajectoryDataset(paths, obs_len=config['obs_len'], pred_len=config['pred_len'],
-                                skip=1, delim='\t', other_modal='gph', areas=[area])
-    if limit is not None:
-        dataset = Subset(dataset, range(min(limit, len(dataset))))
-    return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers, collate_fn=seq_collate)
+def choose_best(experts_absolute, target, mask, sampled_indices):
+    """Use the old summed track distance; retain the winner's full 4-D output."""
+    if experts_absolute.ndim != 4 or experts_absolute.shape[-1] != 4:
+        raise ValueError('Expected expert predictions [horizon, expert, batch, 4]')
+    horizon, experts, batch, _ = experts_absolute.shape
+    if target.shape != (horizon, batch, 4) or mask.shape != (batch, horizon):
+        raise ValueError('Target/mask shape does not match expert predictions')
+    if sampled_indices.ndim != 2 or sampled_indices.shape[0] != batch or sampled_indices.shape[1] < 1:
+        raise ValueError('Expected nonempty [batch, candidates] indices')
+    if not torch.isfinite(experts_absolute).all() or not torch.isfinite(target).all():
+        raise ValueError('Nonfinite predictions or labels')
+    if not torch.isfinite(mask).all() or not ((mask == 0) | (mask == 1)).all() or (mask.sum(1) <= 0).any():
+        raise ValueError('Expected nonempty binary target masks')
+    sampled = sampled_indices.to(device=experts_absolute.device, dtype=torch.long)
+    if (sampled < 0).any() or (sampled >= experts).any():
+        raise ValueError('Sampled expert index out of range')
+    batch_indices = torch.arange(batch, device=experts_absolute.device)
+    candidates = experts_absolute[:, sampled.T, batch_indices, :]
+    distance = ((candidates[..., :2] - target[:, None, :, :2]) ** 2).sum(3).sqrt()
+    winner = (distance * mask.T[:, None, :]).sum(0).argmin(0)
+    return candidates[:, winner, batch_indices, :]
+
+
+def apply_rule(rule, predictions):
+    values = [np.asarray(predictions[key]) for key in rule['keys']]
+    if not values or any(v.shape != values[0].shape for v in values):
+        raise ValueError('Member predictions have different shapes')
+    shape = values[0].shape
+    if len(shape) != 3 or shape[-1] != 4 or not all(np.isfinite(v).all() for v in values):
+        raise ValueError('Expected finite [N, horizon, 4] predictions')
+    if rule['mode'] == 'single_checkpoint':
+        if len(values) != 1:
+            raise ValueError('Identity rule with multiple members')
+        return values[0].copy()
+    if rule['mode'] != 'meta_fusion':
+        raise ValueError('Unknown fusion rule')
+    stack, fused = np.stack(values), np.empty(shape, dtype=np.float32)
+    for feature in range(4):
+        info = rule['model_info']['feat_' + str(feature)]
+        coef = np.asarray(info['coef'], dtype=info['coef_dtype'])
+        x = stack[..., feature].reshape(len(values), -1).T
+        fused[..., feature] = (x @ coef + info['intercept']).reshape(shape[:2])
+    if not np.isfinite(fused).all():
+        raise ValueError('Nonfinite fused predictions')
+    return fused
 
 
 @torch.no_grad()
-def predict(model, batches, device, num_samples):
-    predictions, targets = [], []
-    for batch in batches:
-        obs = torch.cat([batch[0], batch[7]], dim=2).to(device)
-        rel = torch.cat([batch[2], batch[9]], dim=2).to(device)
-        xy, intensity = batch[1].to(device), batch[8].to(device)
-        env = {key: batch[-2][key].to(device) for key in model.env_net_chooser.data_embed}
-        relative, _, _, _ = model(obs, rel, batch[6].to(device), batch[13].to(device),
-                                  env, num_samples=num_samples, all_g_out=False)
-        absolute = relative_to_abs(relative, obs[-1])
-        distance = ((absolute[:, :, :, :2] - xy.unsqueeze(1)) ** 2).sum(3).sqrt().sum(0)
-        winner = distance.argmin(0)
-        selected = torch.stack([absolute[:, winner[b], b] for b in range(absolute.shape[2])], dim=1)
-        px, pv = toNE(selected[:, :, :2].clone(), selected[:, :, 2:].clone())
-        tx, tv = toNE(xy.clone(), intensity.clone())
-        predictions.append(torch.cat([px, pv], dim=2).permute(1, 0, 2).cpu().numpy())
-        targets.append(torch.cat([tx, tv], dim=2).permute(1, 0, 2).cpu().numpy())
-    if not predictions:
-        raise ValueError('No complete test windows')
-    return np.concatenate(predictions), np.concatenate(targets)
-
-
-def fuse(rule, predictions):
-    values = [predictions[key] for key in rule['keys']]
-    shape = values[0].shape
-    if any(value.shape != shape for value in values):
-        raise ValueError('Inconsistent member prediction shapes')
-    if rule['mode'] == 'single_checkpoint':
-        if len(values) != 1:
-            raise ValueError('An identity rule must reference exactly one member')
-        return values[0].copy()
-    if rule['mode'] not in ('meta_fusion', 'linear_fusion'):
-        raise ValueError('Unsupported fusion mode')
-    stacked = np.stack(values)
-    result = np.empty(shape, dtype=np.float32)
-    for feature in range(4):
-        saved = rule['model_info']['feat_{}'.format(feature)]
-        coefficients = np.asarray(saved['coef'], dtype=saved['coef_dtype'])
-        design = stacked[:, :, :, feature].reshape(len(values), -1).T
-        result[:, :, feature] = (design @ coefficients + saved['intercept']).reshape(shape[:2])
-    return result
-
-
-def metrics(prediction, truth):
-    dx = (prediction[:, :, 0] - truth[:, :, 0]) / 10 * 111 * np.cos(np.deg2rad(truth[:, :, 1] / 10))
-    dy = (prediction[:, :, 1] - truth[:, :, 1]) / 10 * 111
-    tde = np.sqrt(dx ** 2 + dy ** 2)
-    press, wind = np.abs(prediction[:, :, 2] - truth[:, :, 2]), np.abs(prediction[:, :, 3] - truth[:, :, 3])
-    return dict(count=len(prediction), ade=float(tde.mean()), fde=float(tde[:, -1].mean()),
-                steps=[[float(a[:, i].mean()) for a in (tde, press, wind)] for i in range(tde.shape[1])],
-                avg=[float(a.mean()) for a in (tde, press, wind)])
-
-
-def table(area, values):
-    bar = '-' * 72
-    lines = ['Area: {}'.format('ALL' if area == 'GLOBAL' else area), 'Overall ADE (km): {:.6f}'.format(values['ade']),
-             'Overall FDE (km): {:.6f}'.format(values['fde']), bar,
-             'Step     | TDE (km)        | Press (hPa)     | Wind (m/s)', bar]
-    for i, row in enumerate(values['steps'], 1):
-        lines.append('Step %-3d | %-15.4f | %-15.4f | %-15.4f' % (i, *row))
-    lines.extend([bar, 'AVG      | %-15.4f | %-15.4f | %-15.4f' % tuple(values['avg']), bar])
-    return '\n'.join(lines)
-
-
-def run(args, checkpoint=None):
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_num or '0'
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        raise RuntimeError('CUDA is unavailable; use --device cpu')
-    torch.set_num_threads(args.threads)
-    if checkpoint is None:
-        checkpoint = load_checkpoint(args.checkpoint)
-    config, bases, keys, rules, defaults = unpack(checkpoint, args.checkpoint, args.state_key)
-    batch_size, samples = args.batch_size or defaults.get('batch_size', 64), args.num_samples or defaults.get('num_samples', 20)
-    seed = defaults.get('seed', 3407) if args.seed is None else args.seed
-    selected = args.areas or [a for a in AREAS if (Path(args.data_dir) / TRACK / a / 'test').is_dir()]
-    if not selected or len(set(selected)) != len(selected) or any(a not in rules for a in selected):
-        raise ValueError('Select available areas without duplicates')
-    areas = [area for area in AREAS if area in selected]
-    needed = {key for area in areas for key in rules[area]['keys']}
-    if not needed or not needed.issubset(bases) or not needed.issubset(keys) or len(set(keys)) != len(keys):
-        raise ValueError('Missing or duplicate parameter sets')
-    batches = {area: test_loader(args.data_dir, config, area, batch_size, args.limit, args.workers) for area in areas}
-    seed_all(seed)
-    generator = TrajectoryGenerator(**config).to(args.device).eval()
-    predictions, targets = {area: {} for area in areas}, {}
-    for key in keys:
-        if key not in needed:
-            continue
-        generator.load_state_dict(bases[key]['state_dict'], strict=True)
-        for area in areas:
-            if key not in rules[area]['keys']:
-                continue
-            seed_all(prediction_seed(seed, key, area))
-            prediction, truth = predict(generator, batches[area], args.device, samples)
-            if not np.isfinite(prediction).all() or not np.isfinite(truth).all():
-                raise ValueError('Non-finite predictions or labels')
-            if area in targets and not np.array_equal(targets[area], truth):
-                raise ValueError('Sample order changed between members')
-            predictions[area][key], targets[area] = prediction, truth
-    results = OrderedDict((area, (fuse(rules[area], predictions[area]), targets[area])) for area in areas)
-    all_pred = np.concatenate([pred for pred, _ in results.values()])
-    all_true = np.concatenate([truth for _, truth in results.values()])
-    if not np.isfinite(all_pred).all():
-        raise ValueError('Non-finite fused predictions')
-    reports = OrderedDict([('GLOBAL', metrics(all_pred, all_true))])
-    reports.update((area, metrics(*values)) for area, values in results.items())
-    text = '\n\n'.join(table(area, report) for area, report in reports.items()) + '\n'
-    if args.output:
-        out = Path(args.output)
-        out.mkdir(parents=True, exist_ok=True)
-        (out / 'summary.txt').write_text(text, encoding='utf-8')
-        if args.save_npz:
-            # Keep native tenths-of-degree positions, matching the original exporter.
-            for area, (pred, truth) in results.items():
-                np.savez_compressed(out / (area + '_results.npz'), pred=pred, gt=truth)
-    return text, reports
-
-
-def run_paper(args, saved):
-    """Evaluate the saved epoch-model state without fitting or feedback updates."""
-    c = dict(saved['config'])
-    if args.areas is not None:
-        if len(set(args.areas)) != len(args.areas) or not set(args.areas).issubset(c['areas']):
-            raise ValueError('Select unique areas included in the saved configuration')
-        c['areas'] = list(args.areas)
-    for key in ('threads', 'workers', 'batch_size', 'seed'):
-        value = getattr(args, key)
-        if value is not None:
-            c[key] = value
-    if args.gpu_num is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_num
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        raise RuntimeError('CUDA is unavailable; use --device cpu')
-    torch.set_num_threads(c['threads'])
+def prediction_panels(bundle, data_root, split, areas, device='cpu', batch_size=None,
+                      threads=2, io_workers=1, cache_frames=4096, progress=None):
+    """Read each batch once, then evaluate all frozen embedded models on it."""
+    from train import ParallelSamples, PrefetchBatches, cached_inputs, unpack_batch_async
+    c = dict(bundle['model_config'], workers=0)
+    c['batch_size'] = batch_size or c['batch_size']
+    if c['batch_size'] < 1 or threads < 1 or io_workers < 0 or cache_frames < 0:
+        raise ValueError('Invalid inference resource settings')
+    device = torch.device(device)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA is unavailable')
+    torch.set_num_threads(threads)
     seed_all(c['seed'])
-    if not args.demo_only:
-        split_manifest(args.data_dir, c['areas'], ['train', 'val', 'test'],
-                       policy=c.get('split_policy', 'paper_years'))
-    model = make_model(c).to(args.device)
-    model.load_state_dict(saved['model'], strict=True)
-    model.eval()
-    stats = collect_statistics(model, loader(make_dataset(args.data_dir, c['areas'], 'test', c), c))
-    result = dict(format=saved['format'], variant=c['variant'], seed=c['seed'],
-                  epoch=saved['epoch'], demo_only=args.demo_only, metrics=stats['metrics'], count=stats['count'])
-    text = json.dumps(result, indent=2, allow_nan=False)
-    path = Path(args.output)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
-    return text + '\n', result
+    models = OrderedDict()
+    for key in bundle['checkpoint_keys']:
+        model = make_model(c).to(device)
+        model.load_state_dict(bundle['base_checkpoints'][key]['state_dict'], strict=True)
+        models[key] = model.eval()
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(cached_inputs(cache_frames))
+        readers = stack.enter_context(ThreadPoolExecutor(max_workers=io_workers)) if io_workers else None
+        for area in areas:
+            dataset = make_dataset(data_root, [area], split, c)
+            data = ParallelSamples(dataset, readers) if readers else dataset
+            batches = loader(data, c)
+            batches.pin_memory = device.type == 'cuda'
+            if readers:
+                collate = batches.collate_fn
+                batches.collate_fn = lambda samples, fn=collate: fn([sample.result() for sample in samples])
+                batches = PrefetchBatches(batches, 2)
+            outputs = {key: [] for key in models}
+            truths, masks = [], []
+            if progress:
+                progress('{} {}: {} windows, {} batches, {} models'.format(split, area, len(dataset), len(batches), len(models)))
+            for index, batch in enumerate(batches, 1):
+                transfer = unpack_batch_async if device.type == 'cuda' else unpack_batch
+                inputs, target, mask = transfer(batch, device)
+                check_mask(mask)
+                tx, tv = toNE(target[..., :2].clone(), target[..., 2:].clone())
+                truth = torch.cat([tx, tv], -1).permute(1, 0, 2).cpu().numpy()
+                truths.append(truth)
+                masks.append(mask.cpu().numpy())
+                for key, model in models.items():
+                    result = model(*inputs)
+                    experts = result['experts_relative'].cumsum(0) + inputs[0][-1][None, None, :, :]
+                    protocol = bundle['evaluation_protocol']
+                    sampled = sample_experts(result['weights'][:, 0], protocol['num_samples'],
+                        protocol['sampling_seed'], key, area, (index - 1) * c['batch_size'])
+                    prediction = choose_best(experts, target, mask, sampled)
+                    px, pv = toNE(prediction[..., :2].clone(), prediction[..., 2:].clone())
+                    values = torch.cat([px, pv], -1).permute(1, 0, 2).cpu().numpy()
+                    if not np.isfinite(values).all() or not np.isfinite(truth).all():
+                        raise ValueError('Nonfinite model predictions or labels')
+                    outputs[key].append(values)
+                if progress and (index == 1 or index % 25 == 0 or index == len(batches)):
+                    progress('{} {}: batch {}/{}'.format(split, area, index, len(batches)))
+            if not truths:
+                raise ValueError('No complete windows for ' + area)
+            yield area, OrderedDict((key, np.concatenate(v)) for key, v in outputs.items()), np.concatenate(truths), np.concatenate(masks)
+
+
+def metrics(prediction, truth, mask):
+    dx = (prediction[..., 0] - truth[..., 0]) / 10 * 111 * np.cos(np.deg2rad(truth[..., 1] / 10))
+    dy = (prediction[..., 1] - truth[..., 1]) / 10 * 111
+    error = np.stack([np.sqrt(dx * dx + dy * dy), np.abs(prediction[..., 2] - truth[..., 2]),
+                      np.abs(prediction[..., 3] - truth[..., 3])], axis=-1)
+    if not np.isfinite(error).all() or mask.shape != error.shape[:2] or not np.isin(mask, [0, 1]).all():
+        raise ValueError('Invalid metric inputs')
+    mass = mask.sum(0, dtype=np.float64)
+    if np.any(mass == 0):
+        raise ValueError('No valid observations for a forecast step')
+    sums = (error * mask[..., None]).sum(0, dtype=np.float64)
+    steps, avg = sums / mass[:, None], sums.sum(0) / mass.sum()
+    return dict(count=len(truth), ade=float(avg[0]), fde=float(steps[-1, 0]),
+                steps=steps.tolist(), avg=avg.tolist(), sums=sums.tolist(), mass=mass.tolist())
+
+
+def aggregate(reports):
+    sums = np.sum([r['sums'] for r in reports.values()], axis=0)
+    mass = np.sum([r['mass'] for r in reports.values()], axis=0)
+    steps, avg = sums / mass[:, None], sums.sum(0) / mass.sum()
+    return dict(count=sum(r['count'] for r in reports.values()), ade=float(avg[0]),
+                fde=float(steps[-1, 0]), steps=steps.tolist(), avg=avg.tolist())
+
+
+def report_text(reports, global_name='Area: ALL'):
+    bar = '-' * 72
+    blocks = []
+    for area, report in [('GLOBAL', aggregate(reports))] + list(reports.items()):
+        name = global_name if area == 'GLOBAL' else 'Area: ' + area
+        lines = ['{} (N={})'.format(name, report['count']),
+                 'Overall ADE (km): {:.6f}'.format(report['ade']),
+                 'Overall FDE (km): {:.6f}'.format(report['fde']), bar,
+                 'Step     | TDE (km)        | Press (hPa)     | Wind (m/s)', bar]
+        for i, values in enumerate(report['steps'], 1):
+            lines.append('Step %-3d | %-15.4f | %-15.4f | %-15.4f' % (i, *values))
+        lines.extend([bar, 'AVG      | %-15.4f | %-15.4f | %-15.4f' % tuple(report['avg']), bar])
+        blocks.append('\n'.join(lines))
+    return '\n\n'.join(blocks) + '\n'
+
+
+def evaluate_bundle(bundle, data_root, areas=None, split='test', **runtime):
+    validate_bundle(bundle)
+    selected = list(bundle['area_models']) if areas is None else list(areas)
+    if not selected or len(set(selected)) != len(selected) or not set(selected).issubset(bundle['area_models']):
+        raise ValueError('Select unique areas with saved fusion rules')
+    selected = [area for area in AREAS if area in selected]
+    reports = OrderedDict()
+    for area, pred, truth, mask in prediction_panels(bundle, data_root, split, selected, **runtime):
+        reports[area] = metrics(apply_rule(bundle['area_models'][area], pred), truth, mask)
+    return report_text(reports), reports
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', '--ckpt_path', default='ckpt.pt')
-    parser.add_argument('--data-dir', '--data-root', '--data_root', default='data_test')
+    parser.add_argument('--data-dir', '--data-root', '--data_root', dest='data_root', required=True)
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
-    parser.add_argument('--gpu-num', '--gpu_num', dest='gpu_num', help='Optional CUDA visibility override; legacy default: 0')
-    parser.add_argument('--state-key', default='auto')
+    parser.add_argument('--gpu-num', '--gpu_num', dest='gpu_num')
     parser.add_argument('--areas', nargs='+', choices=AREAS)
-    parser.add_argument('--seed', type=int)
-    parser.add_argument('--batch-size', '--batch_size', type=int)
-    parser.add_argument('--num-samples', '--num_samples', type=int)
-    parser.add_argument('--workers', '--loader_num_workers', type=int, default=None,
-                        help='Loader workers; for combined epoch models, an alias for --io-workers')
+    parser.add_argument('--seed', type=int, help='Must match the saved checkpoint seed')
+    parser.add_argument('--batch-size', '--batch_size', dest='batch_size', type=int)
     parser.add_argument('--threads', type=int)
-    parser.add_argument('--io-workers', type=int, help='Embedded epoch ensemble: ordered reader threads; 0 reads serially')
-    parser.add_argument('--cache-frames', type=int, help='Embedded epoch ensemble: bounded input cache; 0 disables caching')
-    parser.add_argument('--progress-log', help='Optional progress file for embedded epoch ensemble evaluation')
-    parser.add_argument('--limit', type=int, help='Development only: first N windows per area')
-    parser.add_argument('--output', '--output-dir', '--output_dir',
-                        help='Ensemble: directory for summary.txt (combined default: ./test_report); single epoch model: JSON file path (required)')
-    parser.add_argument('--save_npz', action='store_true', help='With --output, save native-unit prediction arrays')
-    parser.add_argument('--demo-only', action='store_true', help='Epoch model only: skip split-overlap audit for test-only demonstrations')
+    parser.add_argument('--io-workers', '--workers', '--loader_num_workers', dest='io_workers', type=int)
+    parser.add_argument('--cache-frames', type=int)
+    parser.add_argument('--output', '--output-dir', '--output_dir', dest='output', default='./test_report')
+    parser.add_argument('--progress-log', help='Optional separate log; terminal output remains tables only')
     args = parser.parse_args(argv)
-    if any(n is not None and n < 1 for n in (args.batch_size, args.num_samples, args.limit, args.threads)) or (args.workers is not None and args.workers < 0):
-        parser.error('Batch/sample/thread counts must be positive; workers must be nonnegative')
-    if args.seed is not None and not 0 <= args.seed < 2**32:
-        parser.error('seed must be between 0 and 2**32 - 1')
-    if args.save_npz and not args.output:
-        parser.error('--save_npz requires --output')
+    if args.gpu_num is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_num
+    if any(v is not None and v < 1 for v in (args.batch_size, args.threads)):
+        parser.error('Batch size and thread count must be positive')
+    if any(v is not None and v < 0 for v in (args.io_workers, args.cache_frames)):
+        parser.error('Reader count and cache capacity must be nonnegative')
+    output = Path(args.output)
+    if output.exists() and not output.is_dir():
+        parser.error('--output must name a directory')
     with open(os.devnull, 'w') as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
-        checkpoint = load_checkpoint(args.checkpoint)
-    from meta_ensemble import FORMAT as META_FORMAT, evaluate_bundle, report_text
-    from meta_legacy import FORMAT as EXPERT_FORMAT, evaluate_bundle as evaluate_experts
-    if checkpoint.get('format') in (META_FORMAT, EXPERT_FORMAT):
-        evaluator = evaluate_experts if checkpoint['format'] == EXPERT_FORMAT else evaluate_bundle
-        if args.state_key != 'auto' or args.num_samples is not None or args.limit is not None or args.save_npz:
-            parser.error('Ensemble weights and prediction protocol are fixed; omit legacy-only options')
-        if args.seed is not None and args.seed != checkpoint['model_config']['seed']:
-            parser.error('Use the seed saved in the ensemble checkpoint')
-        if args.workers is not None:
-            if args.io_workers is not None and args.io_workers != args.workers:
-                parser.error('--workers and --io-workers must agree when both are supplied')
-            args.io_workers = args.workers
-        if any(n is not None and n < 0 for n in (args.io_workers, args.cache_frames)):
-            parser.error('I/O worker and cache counts must be nonnegative')
-        if args.gpu_num is not None:
-            os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_num
-        out = Path(args.output or './test_report')
-        if out.exists() and not out.is_dir():
-            parser.error('--output must name a directory for combined checkpoints')
-        defaults = dict(batch_size=64, threads=2, io_workers=1, cache_frames=4096)
-        defaults.update(checkpoint.get('evaluation_defaults', {}))
-        runtime = {key: defaults[key] if getattr(args, key) is None else getattr(args, key)
-                   for key in ('batch_size', 'threads', 'io_workers', 'cache_frames')}
-        with contextlib.ExitStack() as stack:
-            quiet = stack.enter_context(open(os.devnull, 'w'))
-            stack.enter_context(contextlib.redirect_stdout(quiet))
-            stack.enter_context(contextlib.redirect_stderr(quiet))
-            progress = None
-            if args.progress_log:
-                progress_path = Path(args.progress_log)
-                progress_path.parent.mkdir(parents=True, exist_ok=True)
-                progress_file = stack.enter_context(progress_path.open('w'))
-                progress = lambda line: print(line, file=progress_file, flush=True)
-            text, reports = evaluator(checkpoint, args.data_dir, areas=args.areas,
-                device=args.device, progress=progress, **runtime)
-        text = report_text(reports, global_name='Area: ALL')
-        out.mkdir(parents=True, exist_ok=True)
-        (out / 'summary.txt').write_text(text, encoding='utf-8')
-        print(text, end='', flush=True)
-        return reports
-    is_paper = checkpoint.get('format') == FORMAT
-    if is_paper:
-        if not args.output:
-            parser.error('Epoch-model evaluation requires --output /path/to/metrics.json')
-        if args.state_key != 'auto' or args.num_samples is not None or args.limit is not None or args.save_npz:
-            parser.error('--state-key/--num-samples/--limit/--save_npz are legacy-only options')
-    else:
-        if args.demo_only:
-            parser.error('--demo-only is for epoch-model checkpoints only')
-        args.threads = 2 if args.threads is None else args.threads
-        args.workers = 0 if args.workers is None else args.workers
-    with open(os.devnull, 'w') as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
-        text, reports = run_paper(args, checkpoint) if is_paper else run(args, checkpoint)
+        bundle = read_checkpoint(args.checkpoint)
+    if args.seed is not None and args.seed != bundle['model_config']['seed']:
+        parser.error('--seed must match the saved checkpoint seed')
+    defaults = dict(batch_size=64, threads=4, io_workers=1, cache_frames=4096)
+    defaults.update(bundle.get('evaluation_defaults', {}))
+    runtime = {key: defaults[key] if getattr(args, key) is None else getattr(args, key)
+               for key in ('batch_size', 'threads', 'io_workers', 'cache_frames')}
+    with contextlib.ExitStack() as stack:
+        quiet = stack.enter_context(open(os.devnull, 'w'))
+        stack.enter_context(contextlib.redirect_stdout(quiet))
+        stack.enter_context(contextlib.redirect_stderr(quiet))
+        progress = None
+        if args.progress_log:
+            path = Path(args.progress_log)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            log = stack.enter_context(path.open('w'))
+            progress = lambda line: print(line, file=log, flush=True)
+        text, reports = evaluate_bundle(bundle, args.data_root, areas=args.areas,
+                                       device=args.device, progress=progress, **runtime)
+    output.mkdir(parents=True, exist_ok=True)
+    (output / 'summary.txt').write_text(text, encoding='utf-8')
     print(text, end='', flush=True)
     return reports
 
