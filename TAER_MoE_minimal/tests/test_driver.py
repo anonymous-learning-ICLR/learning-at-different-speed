@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 import torch
 import train
-import evaluate
+import test as evaluate
 from checkpoint_compat import ORIGINAL_EPOCH_SOURCES, compatible_sources
 from paper_pipeline import make_model, seed_all, load_checkpoint, split_manifest, source_hashes, TRACK
 from test_paper import synthetic_batch
@@ -41,7 +41,7 @@ class Driver(unittest.TestCase):
             best = load_checkpoint(resumed/'best.pt')
             with patch.object(evaluate, 'make_dataset', return_value=[batch]), \
                  patch.object(evaluate, 'loader', return_value=[batch]), \
-                 patch.object(sys, 'argv', ['evaluate.py', '--checkpoint', str(resumed/'best.pt'),
+                 patch.object(sys, 'argv', ['test.py', '--checkpoint', str(resumed/'best.pt'),
                      '--data-root', '/synthetic', '--device', 'cpu', '--demo-only',
                      '--output', str(resumed/'test.json')]):
                 evaluate.main()

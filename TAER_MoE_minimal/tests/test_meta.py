@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from sklearn.linear_model import LinearRegression, Ridge
 
-import evaluate
+import test as evaluate
 import meta_ensemble as meta
 from paper_pipeline import make_model, seed_all, source_hashes, FORMAT
 from train import parser
@@ -97,9 +97,11 @@ class EmbeddedModels(unittest.TestCase):
                 reports=evaluate.main(['--checkpoint',str(path),'--data-root',str(data),'--areas','WP',
                     '--device','cpu','--threads','2','--batch-size','1','--output',str(root/'report')])
             self.assertEqual(reports['WP']['count'],1)
-            self.assertTrue(out.getvalue().startswith('Running evaluation...\nGLOBAL (N=1)'))
+            self.assertTrue(out.getvalue().startswith('Area: ALL (N=1)'))
+            self.assertNotIn('Running evaluation',out.getvalue())
             self.assertNotIn('Unet3D',out.getvalue())
             self.assertTrue((root/'report'/'summary.txt').is_file())
+            self.assertEqual(out.getvalue(),(root/'report'/'summary.txt').read_text())
 
 
 if __name__ == '__main__':

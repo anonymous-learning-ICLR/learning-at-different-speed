@@ -1,15 +1,16 @@
 """Evaluate a combined ckpt.pt, epoch-model checkpoint, or original snapshot.
 
-Example: python evaluate.py --ckpt_path /path/to/ckpt.pt
+Example: python test.py --ckpt_path /path/to/ckpt.pt
          --data_root /path/to/TropiCycloneNet1 --device cuda --output_dir test_report
 
-Combined epoch-model checkpoints print a running notice followed by GLOBAL and
-per-basin tables, also saved to test_report/summary.txt by default. Only the test
+Combined checkpoints print only ALL and per-basin tables, also saved to
+test_report/summary.txt by default. Only the test
 split is read; saved fusion coefficients and routing feedback are not refitted.
 
 The format selects the evaluator automatically. Single epoch-model checkpoints
 use --output metrics.json. Original ensembles retain their ground-truth Best-of-K
-protocol. Fusion fitted on test data does not constitute a held-out test score.
+protocol. The supplied ckpt.pt uses sampled experts and ground-truth Best-of-K.
+Fusion fitted on test data does not constitute a held-out test score.
 """
 import argparse
 import contextlib
@@ -57,6 +58,9 @@ TRACK = 'bst_divi10_train_val_test_inlcude15_2023_new'
 
 
 def load_checkpoint(path):
+    with Path(path).open('rb') as stream:
+        if stream.read(128).startswith(b'version https://git-lfs.github.com/spec/v1'):
+            raise ValueError('Checkpoint is a Git LFS pointer; run git lfs pull to download its weights')
     kwargs = dict(map_location='cpu')
     if 'weights_only' in inspect.signature(torch.load).parameters:
         kwargs['weights_only'] = False
@@ -286,7 +290,7 @@ def run_paper(args, saved):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--checkpoint', '--ckpt_path', required=True)
+    parser.add_argument('--checkpoint', '--ckpt_path', default='ckpt.pt')
     parser.add_argument('--data-dir', '--data-root', '--data_root', default='data_test')
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     parser.add_argument('--gpu-num', '--gpu_num', dest='gpu_num', help='Optional CUDA visibility override; legacy default: 0')
@@ -313,9 +317,12 @@ def main(argv=None):
         parser.error('seed must be between 0 and 2**32 - 1')
     if args.save_npz and not args.output:
         parser.error('--save_npz requires --output')
-    checkpoint = load_checkpoint(args.checkpoint)
-    from meta_ensemble import FORMAT as META_FORMAT, evaluate_bundle
-    if checkpoint.get('format') == META_FORMAT:
+    with open(os.devnull, 'w') as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+        checkpoint = load_checkpoint(args.checkpoint)
+    from meta_ensemble import FORMAT as META_FORMAT, evaluate_bundle, report_text
+    from meta_legacy import FORMAT as EXPERT_FORMAT, evaluate_bundle as evaluate_experts
+    if checkpoint.get('format') in (META_FORMAT, EXPERT_FORMAT):
+        evaluator = evaluate_experts if checkpoint['format'] == EXPERT_FORMAT else evaluate_bundle
         if args.state_key != 'auto' or args.num_samples is not None or args.limit is not None or args.save_npz:
             parser.error('Ensemble weights and prediction protocol are fixed; omit legacy-only options')
         if args.seed is not None and args.seed != checkpoint['model_config']['seed']:
@@ -335,18 +342,19 @@ def main(argv=None):
         defaults.update(checkpoint.get('evaluation_defaults', {}))
         runtime = {key: defaults[key] if getattr(args, key) is None else getattr(args, key)
                    for key in ('batch_size', 'threads', 'io_workers', 'cache_frames')}
-        print('Running evaluation...', flush=True)
         with contextlib.ExitStack() as stack:
             quiet = stack.enter_context(open(os.devnull, 'w'))
             stack.enter_context(contextlib.redirect_stdout(quiet))
+            stack.enter_context(contextlib.redirect_stderr(quiet))
             progress = None
             if args.progress_log:
                 progress_path = Path(args.progress_log)
                 progress_path.parent.mkdir(parents=True, exist_ok=True)
                 progress_file = stack.enter_context(progress_path.open('w'))
                 progress = lambda line: print(line, file=progress_file, flush=True)
-            text, reports = evaluate_bundle(checkpoint, args.data_dir, areas=args.areas,
+            text, reports = evaluator(checkpoint, args.data_dir, areas=args.areas,
                 device=args.device, progress=progress, **runtime)
+        text = report_text(reports, global_name='Area: ALL')
         out.mkdir(parents=True, exist_ok=True)
         (out / 'summary.txt').write_text(text, encoding='utf-8')
         print(text, end='', flush=True)

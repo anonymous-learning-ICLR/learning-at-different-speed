@@ -197,7 +197,8 @@ def apply_rule(rule, predictions):
 
 @torch.no_grad()
 def prediction_panels(bundle, data_root, split, areas, device='cpu', batch_size=None,
-                      threads=2, io_workers=1, cache_frames=4096, progress=None):
+                      threads=2, io_workers=1, cache_frames=4096, progress=None,
+                      prediction_selector=None):
     """Read each batch once, then evaluate all frozen embedded models on it."""
     from train import ParallelSamples, PrefetchBatches, cached_inputs, unpack_batch_async
     c = dict(bundle['model_config'], workers=0)
@@ -239,7 +240,12 @@ def prediction_panels(bundle, data_root, split, areas, device='cpu', batch_size=
                 truths.append(truth)
                 masks.append(mask.cpu().numpy())
                 for key, model in models.items():
-                    prediction, _ = absolute_outputs(model(*inputs), inputs[0][-1])
+                    result = model(*inputs)
+                    if prediction_selector is None:
+                        prediction, _ = absolute_outputs(result, inputs[0][-1])
+                    else:
+                        prediction = prediction_selector(result, inputs[0][-1], target, mask,
+                            key, area, (index - 1) * c['batch_size'])
                     px, pv = toNE(prediction[..., :2].clone(), prediction[..., 2:].clone())
                     values = torch.cat([px, pv], -1).permute(1, 0, 2).cpu().numpy()
                     if not np.isfinite(values).all() or not np.isfinite(truth).all():
@@ -276,11 +282,11 @@ def aggregate(reports):
                 fde=float(steps[-1, 0]), steps=steps.tolist(), avg=avg.tolist())
 
 
-def report_text(reports):
+def report_text(reports, global_name='GLOBAL'):
     bar = '-' * 72
     blocks = []
     for area, report in [('GLOBAL', aggregate(reports))] + list(reports.items()):
-        name = 'GLOBAL' if area == 'GLOBAL' else 'Area: ' + area
+        name = global_name if area == 'GLOBAL' else 'Area: ' + area
         lines = ['{} (N={})'.format(name, report['count']),
                  'Overall ADE (km): {:.6f}'.format(report['ade']),
                  'Overall FDE (km): {:.6f}'.format(report['fde']), bar,
