@@ -1,6 +1,6 @@
 # TAER-MoE
 
-Training, single-model testing, and tropical cyclone visualization examples.
+Training, testing, and tropical cyclone visualization examples.
 `data_test` contains the selected Nadine (1974) test case (4 windows); `data_demo` contains the Meranti (2010) visualization example. The full dataset will be released later.
 
 ## Install
