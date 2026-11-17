@@ -1,12 +1,11 @@
-# Learning at Different Speed — TAER-MoE Demo
+# TAER-MoE
 
-A runnable sample with training code, a checkpoint, one tropical cyclone test case, and visualization examples. Try the commands below to inspect the data and results.
-
-**This is a demo release. The full dataset will be released later.** Training and validation data are not included.
+Training, single-model testing, and tropical cyclone visualization examples.
+`data_test` contains the selected Nadine (1974) test case (4 windows); `data_demo` contains the Meranti (2010) visualization example. The full dataset will be released later.
 
 ## Install
 
-Use Python 3.8 and install Git LFS first.
+Install Git LFS, then run:
 
 ```bash
 git lfs install
@@ -21,17 +20,12 @@ bash install.sh
 
 ## Test
 
-Run from `TAER_MoE_minimal/`:
-
 ```bash
-python test.py --checkpoint ckpt.pt --data-dir data_demo --areas WP --device cpu --threads 4 --workers 0 --output demo_results
+python test.py --checkpoint ckpt.pt --data-dir data_test --device cpu
 ```
 
-For GPU 0, replace `--device cpu` with `--device cuda --gpu_num 0`.
-
-The script prints only ALL and regional error tables, also saved to `demo_results/summary.txt`. The bundled example contains one WP test window.
-
-The supplied checkpoint uses test-label calibration and true-future candidate selection. These demo scores are not independent held-out results.
+For GPU 0, use `CUDA_VISIBLE_DEVICES=0 python test.py --checkpoint ckpt.pt --data-dir data_test --device cuda`.
+The script prints ALL and regional error tables and saves `test_report/summary.txt`.
 
 ## Visualize
 
@@ -39,17 +33,20 @@ The supplied checkpoint uses test-label calibration and true-future candidate se
 python visualize.py --data-dir data_demo --output visualizations
 ```
 
-Four example outputs:
+Outputs: [1D table](TAER_MoE_minimal/visualizations/data_1d.csv), [3D environment](TAER_MoE_minimal/visualizations/environment_3d.png), [Feature 6](TAER_MoE_minimal/visualizations/features6.png), and [Feature 10](TAER_MoE_minimal/visualizations/features10.png).
 
-- [1D data table](TAER_MoE_minimal/visualizations/data_1d.csv)
-- [3D environment plot](TAER_MoE_minimal/visualizations/environment_3d.png)
-- [Feature 6](TAER_MoE_minimal/visualizations/features6.png)
-- [Feature 10](TAER_MoE_minimal/visualizations/features10.png)
+![3D environment](TAER_MoE_minimal/visualizations/environment_3d.png)
+![Feature 6](TAER_MoE_minimal/visualizations/features6.png)
+![Feature 10](TAER_MoE_minimal/visualizations/features10.png)
 
 ## Train
 
-Training requires separately obtained training and validation data. See the available options:
+Training requires separately obtained training and validation data in the same dataset layout.
 
 ```bash
-python train.py --help
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  --data-root /path/to/TropiCycloneNet1 --output-dir runs/seed200 \
+  --variant full --seed 200 --device cuda --areas EP NA NI SI SP WP \
+  --epochs 101 --batch-size 64 --workers 4 --threads 4 \
+  --feature-mode legacy --feature-reduction none --split-policy existing
 ```

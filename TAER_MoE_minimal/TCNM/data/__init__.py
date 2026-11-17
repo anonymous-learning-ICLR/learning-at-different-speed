@@ -1,1 +1,1 @@
-from .trajectoriesWithMe_unet_training_4to4 import seq_collate, TrajectoryDataset
+from .paper_data import seq_collate, TrajectoryDataset

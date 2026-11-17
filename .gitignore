@@ -4,5 +4,4 @@ __pycache__/
 TAER_MoE_minimal/runs/
 TAER_MoE_minimal/demo_results/
 TAER_MoE_minimal/test_report/
-TAER_MoE_minimal/data_test/
 *.tmp
