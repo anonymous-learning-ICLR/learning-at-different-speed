@@ -1,7 +1,9 @@
 __pycache__/
 *.py[cod]
-.pytest_cache/
+.DS_Store
+.venv/
 TAER_MoE_minimal/runs/
-TAER_MoE_minimal/demo_results/
 TAER_MoE_minimal/test_report/
+TAER_MoE_minimal/demo_results/
+TAER_MoE_minimal/visualizations/
 *.tmp
